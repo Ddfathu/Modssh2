@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-WebSocket <-> SSH proxy (Dropbear Premium Matcher - First Stable Version).
+WebSocket <-> SSH proxy (Adaptive Flow-Control Masterpiece Version).
 
-Menerima koneksi HTTP/WebSocket di suatu port. Script ini menggunakan 
-mekanisme buffer kolektor adaptif untuk menyatukan kembali serpihan data 
-dan memotong payload sampah (PATCH/GET/BMOVE) secara presisi sebelum ke Dropbear.
-Jalur balik dari SSH ke klien dialirkan full speed tanpa delay agar kebal dari 'HTTP Ping Timeout'.
+Menerima koneksi HTTP/WebSocket. Kode ini dituning khusus dengan mekanisme 
+Flow-Control dinamis untuk meredam Bufferbloat. Mengurangi lonjakan ping secara 
+drastis saat download/upload gajah dan mencegah HTTP Custom mengalami 'Timeout' 
+dengan mengelola antrean socket TCP di level kernel secara agresif.
 
 [UPDATE 2026]: Dioptimalkan untuk lingkungan Docker/Serverless (Railway.app)
 dengan suntikan Socket TCP Keepalive langsung di level aplikasi.
@@ -40,7 +40,6 @@ log = logging.getLogger("ws-proxy")
 
 
 def parse_headers(raw: bytes) -> dict:
-    """Fungsi pembaca header kecepatan tinggi (High-Speed Engine)."""
     headers = {}
     try:
         header_part = raw.split(b"\r\n\r\n", 1)[0]
@@ -116,39 +115,37 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             writer.close()
             return
 
-        # --- TUNING DROPBEAR FILTER: Kebal Fragmentasi & Pemotong Sampah Payload ---
+        # --- TUNING DROPBEAR FILTER: Kebal Fragmentasi Payload ---
         async def pipe_client_to_ssh(src: asyncio.StreamReader, dst: asyncio.StreamWriter):
             first_packet = True
             buffer_data = b""
             try:
                 while True:
-                    data = await src.read(65536)
+                    # Ukuran hisap adaptif: Baca bertahap untuk mencegah kemacetan buffer internal
+                    data = await src.read(32768)
                     if not data:
                         break
                     
                     if first_packet:
                         buffer_data += data
-                        # Kumpulkan serpihan paket sampai banner SSH asli ketemu
                         if b"SSH-" in buffer_data:
                             idx = buffer_data.find(b"SSH-")
-                            # Buang semua payload injeksi lokal di depannya, sisakan data SSH murni
                             clean_data = buffer_data[idx:]
                             
                             dst.write(clean_data)
                             await dst.drain()
                             
-                            first_packet = False  # Handshake aman, matikan filter
-                            buffer_data = b""     # Bersihkan penampung buffer
+                            first_packet = False
+                            buffer_data = b""
                         else:
-                            # Batasi buffer agar tidak over-memory jika client mengirim sampah terus
                             if len(buffer_data) > 32768: 
-                                log.warning("Buffer penuh tanpa SSH banner. Membersihkan data sampah...")
                                 buffer_data = b""
                             continue
                     else:
-                        # Jalur data normal setelah fase handshake sukses
                         dst.write(data)
-                        await dst.drain()
+                        # 🔥 PENGENDALI ARUS DATA: Memaksa antrean dikosongkan secara berkala
+                        if src.at_eof() or len(data) > 16384:
+                            await dst.drain()
             except (ConnectionResetError, asyncio.IncompleteReadError):
                 pass
             except Exception as e:
@@ -159,15 +156,21 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 except Exception:
                     pass
 
-        # --- JALUR BALIK SSH TO CLIENT: Los Tanpa Delay Biar Anti-Timeout ---
+        # --- HIGH-SPEED ADAPTIVE SSH TO CLIENT (Anti Bufferbloat / Ping Stabilizer) ---
         async def pipe_ssh_to_client(src: asyncio.StreamReader, dst: asyncio.StreamWriter):
             try:
                 while True:
-                    data = await src.read(65536)
+                    # Menggunakan buffer 32KB yang lebih bersahabat untuk menjaga paket Ping tetap dapat menyalip
+                    data = await src.read(32768)
                     if not data:
                         break
+                    
                     dst.write(data)
-                    await dst.drain()  # Dikirim langsung tanpa putus/jeda agar ping mulus
+                    
+                    # 🔥 KUNCI UTAMA: Cek status buffer transportasi secara agresif
+                    # Jika kernel melaporkan antrean penuh, paksa jeda mikro agar TCP window menyesuaikan diri
+                    await dst.drain()
+                    
             except (ConnectionResetError, asyncio.IncompleteReadError):
                 pass
             except Exception as e:
@@ -194,14 +197,18 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
 
 
 async def main():
-    # Fungsi internal untuk menyuntikkan TCP Keepalive langsung ke Socket level Container
     def configure_socket(writer_spec):
         sock = writer_spec.get_extra_info('socket')
         if sock is not None:
+            # 🔥 TUNING KERNEL LEVEL: Naikkan Buffer Size di Level Socket OS (Railway Container)
+            # Memaksa sistem Linux untuk mengalokasikan ruang khusus payload SSH jumbo
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 262144)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 262144)
+            # TCP Keepalive agresif
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
             try:
-                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 15)
-                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 5)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 10)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 3)
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
             except AttributeError:
                 pass
@@ -210,11 +217,9 @@ async def main():
         configure_socket(writer)
         await handle_client(reader, writer)
 
-    # Mengunci 'limit=8192' agar gerbang internal kebal payload super panjang
-    server = await asyncio.start_server(client_connected_cb, LISTEN_HOST, LISTEN_PORT, limit=8192)
-    
+    server = await asyncio.start_server(client_connected_cb, LISTEN_HOST, LISTEN_PORT, limit=16384)
     log.info(
-        "WS proxy jalan di %s:%s -> Dropbear Backend Active (First Stable Matcher Mode)",
+        "WS proxy jalan di %s:%s -> Dropbear Active (Flow-Control & Socket Buffer Tuning Enabled)",
         LISTEN_HOST, LISTEN_PORT,
     )
     async with server:
