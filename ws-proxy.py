@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-WebSocket <-> SSH proxy (Premium Blind Tunneling Version).
+WebSocket <-> SSH proxy (Signal Armor Premium Version).
 
-Menerima koneksi HTTP dari Dark Tunnel/HTTP Custom. Kode ini dimodifikasi total 
-agar mengabaikan status kode dari operator (kebal 301 Moved Permanently/200 OK).
-Begitu ada koneksi masuk, server langsung merespons dengan jabat tangan sukses,
-memotong teks sampah manipulasi, dan mengalirkan data tanpa banyak tanya.
+Menerima koneksi HTTP dari Dark Tunnel/HTTP Custom. Kode ini dilengkapi 
+dengan kasta tertinggi optimalisasi jaringan (TCP_NODELAY + Buffer 512KB) 
+serta dituning dengan "Signal Armor" agar koneksi melekat kuat seperti perangko, 
+kebal dari rekonek prematur meskipun sinyal HP drop hingga ke titik terendah.
 
 [UPDATE 2026]: Dioptimalkan untuk lingkungan Docker/Serverless (Railway.app)
-dengan suntikan Socket TCP Keepalive langsung di level aplikasi.
+dengan suntikan Socket TCP Keepalive level dewa langsung di aplikasi.
 """
 
 import asyncio
@@ -30,9 +30,9 @@ TARGET_PORT = int(os.environ.get("WS_TARGET_PORT", "22"))
 
 logging.basicConfig(
     level=logging.INFO,
-    format="[ws-proxy] %(asctime)s %(levelname)s %(message)s",
+    format="[ws-proxy-armor] %(asctime)s %(levelname)s %(message)s",
 )
-log = logging.getLogger("ws-proxy")
+log = logging.getLogger("ws-proxy-armor")
 
 
 def parse_headers(raw: bytes) -> dict:
@@ -58,11 +58,10 @@ def make_accept_key(ws_key: str) -> str:
 
 async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     peer = writer.get_extra_info("peername")
-    log.info("Koneksi masuk dari %s", peer)
 
     try:
         # Baca header awal
-        raw_headers = await reader.read(4096)
+        raw_headers = await reader.read(8192)
         if not raw_headers:
             writer.close()
             return
@@ -70,7 +69,6 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         headers = parse_headers(raw_headers)
         raw_text_lower = raw_headers.decode(errors="ignore").lower()
 
-        # 🔥 TUNING PREMIUM: Bikin kunci WebSocket palsu / asli secara otomatis tanpa pilih-pilih status
         ws_key = headers.get("sec-websocket-key")
         if not ws_key and "sec-websocket-key:" in raw_text_lower:
             try:
@@ -84,7 +82,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         if not ws_key:
             ws_key = base64.b64encode(secrets.token_bytes(16)).decode()
 
-        # 🔥 SELALU KIRIM 101 SWITCHING PROTOCOLS (Abaikan status 301/200 dari operator)
+        # Respon buta premium (Anti 301)
         accept_key = make_accept_key(ws_key)
         response = (
             "HTTP/1.1 101 Switching Protocols\r\n"
@@ -99,23 +97,27 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         writer.write(response.encode())
         await writer.drain()
 
-        # Koneksikan ke Dropbear internal
+        # Hubungkan ke Dropbear internal
         try:
             target_reader, target_writer = await asyncio.open_connection(
                 TARGET_HOST, TARGET_PORT
             )
         except Exception as e:
-            log.error("Gagal konek ke target %s:%s -> %s", TARGET_HOST, TARGET_PORT, e)
+            log.error("Gagal konek ke target SSH -> %s", e)
             writer.close()
             return
 
-        # --- TUNING DROPBEAR FILTER (Saring Sampah Payload) ---
+        target_sock = target_writer.get_extra_info('socket')
+        if target_sock is not None:
+            target_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+        # --- DROPBEAR MATCH FILTER ---
         async def pipe_client_to_ssh(src: asyncio.StreamReader, dst: asyncio.StreamWriter):
             first_packet = True
             buffer_data = b""
             try:
                 while True:
-                    data = await src.read(32768)
+                    data = await src.read(65536)
                     if not data:
                         break
                     
@@ -129,36 +131,35 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                             first_packet = False
                             buffer_data = b""
                         else:
-                            if len(buffer_data) > 32768: 
+                            if len(buffer_data) > 65536: 
                                 buffer_data = b""
                             continue
                     else:
                         dst.write(data)
-                        if src.at_eof() or len(data) > 16384:
-                            await dst.drain()
+                        await dst.drain()
             except (ConnectionResetError, asyncio.IncompleteReadError):
                 pass
-            except Exception as e:
-                log.debug("pipe_client error: %s", e)
+            except Exception:
+                pass
             finally:
                 try:
                     dst.close()
                 except Exception:
                     pass
 
-        # --- HIGH-SPEED BLIND PIPE: Los Tanpa Cek Status ---
+        # --- HIGH-SPEED BLIND PIPE ---
         async def pipe_ssh_to_client(src: asyncio.StreamReader, dst: asyncio.StreamWriter):
             try:
                 while True:
-                    data = await src.read(32768)
+                    data = await src.read(65536)
                     if not data:
                         break
                     dst.write(data)
                     await dst.drain()
             except (ConnectionResetError, asyncio.IncompleteReadError):
                 pass
-            except Exception as e:
-                log.debug("pipe_ssh error: %s", e)
+            except Exception campaigners:
+                pass
             finally:
                 try:
                     dst.close()
@@ -170,8 +171,8 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             pipe_ssh_to_client(target_reader, writer),
         )
 
-    except Exception as e:
-        log.error("Error menangani klien %s: %s", peer, e)
+    except Exception:
+        pass
     finally:
         try:
             writer.close()
@@ -183,13 +184,23 @@ async def main():
     def configure_socket(writer_spec):
         sock = writer_spec.get_extra_info('socket')
         if sock is not None:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 262144)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 262144)
+            # Turbo speed (Nagle Off)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            
+            # Monster Buffer (512 KB)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 524288)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 524288)
+            
+            # 🔥 TUNING SIGNAL ARMOR (Anti-Disconnect Level Dewa):
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
             try:
-                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 15)
-                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 5)
-                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+                # Jeda sebelum memulai probe dinaikkan jadi 30 detik (menghindari panik saat sinyal drop)
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30)
+                # Kirim paket pengecekan setiap 10 detik sekali jika HP hilang kontak
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+                # Toleransi kesalahan dinaikkan menjadi 12 kali gagal (Total pertahanan = 30 + (10 * 12) = 150 detik!)
+                # Server akan sabar menunggu sinyal HP lu balik selama 2,5 menit sebelum memutus koneksi murni.
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEBCNT if hasattr(socket, 'TCP_KEEBCNT') else 6, 12)
             except AttributeError:
                 pass
 
@@ -197,8 +208,8 @@ async def main():
         configure_socket(writer)
         await handle_client(reader, writer)
 
-    server = await asyncio.start_server(client_connected_cb, LISTEN_HOST, LISTEN_PORT, limit=16384)
-    log.info("WS proxy jalan di %s:%s -> Dropbear Backend Active (Blind Premium Mode)", LISTEN_HOST, LISTEN_PORT)
+    server = await asyncio.start_server(client_connected_cb, LISTEN_HOST, LISTEN_PORT, limit=32768)
+    log.info("WS proxy jalan di %s:%s -> Dropbear Active (Signal Armor Mode Enabled)", LISTEN_HOST, LISTEN_PORT)
     async with server:
         await server.serve_forever()
 
