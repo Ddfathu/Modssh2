@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-TCP Multiplexer Premium ala sslh (Continuous Fragmenter Edition).
+TCP Multiplexer sederhana ala sslh (High-Speed Pure Edition).
 
-Mendengarkan di SATU port publik dengan proteksi timeout, serta menerapkan
-trik fragmentasi data balik (Server-to-Client Packet Splitting) secara berkala
-untuk meniru ketahanan sistem SSH Premium komersial terhadap sensor operator.
+Mendengarkan di SATU port publik, mengintip bita pertama dengan proteksi timeout,
+lalu meneruskan seluruh data secara murni dan secepat kilat (tanpa delay/fragmentasi)
+ke backend WS atau SSL agar terhindar dari kendala 'Timeout' akibat tumpukan buffer.
 """
 
 import asyncio
@@ -17,10 +17,10 @@ LISTEN_HOST = "0.0.0.0"
 LISTEN_PORT = int(os.environ.get("MAIN_MUX_PORT", os.environ.get("PORT", "443")))
 
 SSL_TARGET_HOST = os.environ.get("SSL_TARGET_HOST", "127.0.0.1")
-SSL_TARGET_PORT = int(os.environ.get("SSL_TARGET_PORT", "2443"))
+SSL_TARGET_PORT = int(os.environ.get("SSL_TARGET_PORT", "2443"))  # stunnel internal
 
 WS_TARGET_HOST = os.environ.get("WS_MUX_TARGET_HOST", "127.0.0.1")
-WS_TARGET_PORT = int(os.environ.get("WS_MUX_TARGET_PORT", "8880"))
+WS_TARGET_PORT = int(os.environ.get("WS_MUX_TARGET_PORT", "8880"))  # ws-proxy internal
 
 TLS_HANDSHAKE_BYTE = 0x16
 
@@ -31,56 +31,18 @@ logging.basicConfig(
 log = logging.getLogger("mux")
 
 
-# Jalur Upload: Dari HP ke SSH Server (Dialirkan normal tanpa hambatan)
-async def pipe_upstream(src: asyncio.StreamReader, dst: asyncio.StreamWriter):
+async def pipe(src: asyncio.StreamReader, dst: asyncio.StreamWriter):
     try:
         while True:
-            data = await src.read(16384)
+            data = await src.read(65536)
             if not data:
                 break
             dst.write(data)
-            await dst.drain()
+            await dst.drain()  # Aliran data langsung tanpa interupsi
     except (ConnectionResetError, asyncio.IncompleteReadError):
         pass
     except Exception as e:
-        log.debug("pipe upstream error: %s", e)
-    finally:
-        try:
-            dst.close()
-        except Exception:
-            pass
-
-
-# 🔥 JALUR DOWNSTREAM PREMIUM: Dari SSH Server ke HP (Dipecah Agresif Biar Kebal)
-async def pipe_downstream_premium(src: asyncio.StreamReader, dst: asyncio.StreamWriter):
-    packet_count = 0
-    try:
-        while True:
-            data = await src.read(32768)
-            if not data:
-                break
-            
-            # 100 paket pertama (fase kritis jabat tangan + autentikasi + ping awal) kita pecah total
-            if packet_count < 100:
-                packet_count += 1
-                
-                # Potong data menjadi serpihan kecil (per 4 bytes) untuk membingungkan DPI & mengunci HP
-                chunk_size = 4
-                for i in range(0, len(data), chunk_size):
-                    chunk = data[i:i+chunk_size]
-                    dst.write(chunk)
-                    await dst.drain()
-                    # Jeda mikro tanpa memicu timeout untuk memaksa TCP Window bergetar
-                    await asyncio.sleep(0.001)
-            else:
-                # Lewat fase kritis, lepas data dengan kecepatan penuh
-                dst.write(data)
-                await dst.drain()
-                
-    except (ConnectionResetError, asyncio.IncompleteReadError):
-        pass
-    except Exception as e:
-        log.debug("pipe downstream error: %s", e)
+        log.debug("pipe error: %s", e)
     finally:
         try:
             dst.close()
@@ -93,12 +55,13 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
     first_byte = b""
 
     try:
-        # Intip byte pertama dengan batas waktu 0.5 detik
+        # Intip byte pertama dengan batas waktu 0.5 detik (Anti-Stuck)
         try:
             first_byte = await asyncio.wait_for(reader.read(1), timeout=0.5)
         except asyncio.TimeoutError:
             first_byte = b""
 
+        # Tentukan target backend
         if first_byte and first_byte[0] == TLS_HANDSHAKE_BYTE:
             target_host, target_port, label = SSL_TARGET_HOST, SSL_TARGET_PORT, "SSL/stunnel"
         else:
@@ -113,14 +76,15 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             writer.close()
             return
 
+        # Kirim bita pertama yang diintip ke backend tujuan
         if first_byte:
             target_writer.write(first_byte)
             await target_writer.drain()
 
-        # Jalankan dua arah dengan filter downstream premium
+        # Jalankan pipa data dua arah murni tanpa manipulasi tambahan
         await asyncio.gather(
-            pipe_upstream(reader, target_writer),
-            pipe_downstream_premium(target_reader, writer),
+            pipe(reader, target_writer),
+            pipe(target_reader, writer),
         )
 
     except Exception as e:
@@ -133,9 +97,10 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
 
 
 async def main():
+    # Mengunci 'limit=16384' agar gerbang pertama kebal total dari payload super panjang
     server = await asyncio.start_server(handle_client, LISTEN_HOST, LISTEN_PORT, limit=16384)
     log.info(
-        "Mux jalan di %s:%s -> SSL:%s | WS:%s (Premium Fragmenter Active)",
+        "Mux jalan di %s:%s -> SSL:%s | WS:%s (High-Speed Active)",
         LISTEN_HOST, LISTEN_PORT, SSL_TARGET_PORT, WS_TARGET_PORT,
     )
     async with server:
