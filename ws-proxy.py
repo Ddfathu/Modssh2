@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-WebSocket <-> SSH Proxy (Full Frame Parser Edition).
+WebSocket <-> SSH Proxy (Full Frame Parser + Fragmentasi).
 
 Mendukung:
 - Handshake WebSocket (RFC 6455)
-- Parsing & unmasking frame
+- Parsing & unmasking frame, termasuk fragmentasi (continuation)
 - Binary/Text frame ke SSH, dan sebaliknya
 - Ping/Pong otomatis (dengan heartbeat periodik)
 - Close frame graceful
-- TCP_NODELAY, buffer 512KB, keepalive 2,5 menit
+- Turbo, Buffer Monster, Signal Armor
 """
 
 import asyncio
@@ -21,7 +21,6 @@ import sys
 import secrets
 import socket
 import struct
-import time
 
 WS_MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
@@ -38,13 +37,13 @@ log = logging.getLogger("ws-proxy")
 
 
 # =====================================================================
-#  FUNGSI HANDLER FRAME WEBSOCKET (RFC 6455)
+#  FUNGSI BACA & KIRIM FRAME WEBSOCKET (RFC 6455)
 # =====================================================================
 
 async def read_frame(reader: asyncio.StreamReader):
     """
     Membaca satu frame WebSocket dari reader.
-    Return: (opcode, payload)  (payload sudah di-unmask jika perlu)
+    Return: (fin, opcode, payload)  # fin = bool, payload sudah di-unmask
     Raise:  ConnectionResetError jika koneksi putus.
     """
     header = await reader.readexactly(2)
@@ -75,19 +74,53 @@ async def read_frame(reader: asyncio.StreamReader):
     if masked:
         payload = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
 
-    # Untuk frame kontrol (Ping/Pong/Close), fin harus 1
-    if opcode in (0x8, 0x9, 0xA) and not fin:
-        raise ValueError("Control frame must have FIN=1")
-
-    return opcode, payload
+    return fin, opcode, payload
 
 
-async def send_frame(writer: asyncio.StreamWriter, opcode: int, payload: bytes):
+async def read_message(reader: asyncio.StreamReader):
+    """
+    Membaca satu pesan WebSocket (bisa terdiri dari beberapa frame).
+    Menggabungkan continuation frame hingga FIN=1.
+    Return: (opcode, payload)  # opcode dari frame pertama (0x1/0x2) atau control frame
+    """
+    fin, opcode, payload = await read_frame(reader)
+
+    # Control frame (Ping/Pong/Close) tidak boleh difragmentasi
+    if opcode in (0x8, 0x9, 0xA):
+        return opcode, payload
+
+    # Jika sudah FIN, langsung kembali
+    if fin:
+        return opcode, payload
+
+    # Kumpulkan continuation frame
+    fragments = [payload]
+    while not fin:
+        fin, next_opcode, next_payload = await read_frame(reader)
+        if next_opcode != 0x0:  # Harus continuation
+            # Jika bukan continuation, kita anggap sebagai frame baru (tidak sesuai RFC)
+            log.warning("Ditemukan opcode %X saat menunggu continuation", next_opcode)
+            # Gabungkan yang sudah ada dan return, atau lempar error? Lebih baik return yang ada
+            break
+        fragments.append(next_payload)
+        # Jika sudah fin, loop berhenti
+        if fin:
+            break
+
+    # Gabungkan semua payload
+    full_payload = b''.join(fragments)
+    return opcode, full_payload
+
+
+async def send_frame(writer: asyncio.StreamWriter, opcode: int, payload: bytes, fin: bool = True):
     """
     Mengirim satu frame WebSocket (tanpa masking, karena server -> client tidak wajib mask).
     """
     header = bytearray()
-    header.append(0x80 | opcode)  # FIN=1
+    if fin:
+        header.append(0x80 | opcode)
+    else:
+        header.append(opcode)  # FIN=0
 
     length = len(payload)
     if length <= 125:
@@ -130,7 +163,6 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
 
         ws_key = headers.get("sec-websocket-key")
         if not ws_key:
-            # Coba ekstrak manual
             for line in lines:
                 if "sec-websocket-key" in line.lower():
                     ws_key = line.split(":", 1)[1].strip()
@@ -191,14 +223,13 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 except Exception:
                     break
 
-        # 5. TASK: BACA FRAME DARI CLIENT -> TERUSKAN KE SSH
+        # 5. TASK: BACA PESAN DARI CLIENT -> TERUSKAN KE SSH
         async def client_to_ssh():
             try:
                 while True:
-                    opcode, payload = await read_frame(reader)
+                    opcode, payload = await read_message(reader)
                     if opcode == 0x8:  # Close
                         log.info("Client mengirim Close frame")
-                        # Kirim balik Close
                         await send_frame(writer, 0x8, payload)
                         break
                     elif opcode == 0x9:  # Ping -> balas Pong
@@ -211,16 +242,14 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                     else:
                         log.warning("Opcode tidak dikenal: 0x%X", opcode)
             except (ConnectionResetError, asyncio.IncompleteReadError):
-                log.debug("Client putus koneksi saat baca frame")
+                log.debug("Client putus koneksi saat baca pesan")
             except Exception as e:
                 log.error("Error di client->ssh: %s", e)
             finally:
-                # Tutup target SSH jika belum
                 try:
                     target_writer.close()
                 except Exception:
                     pass
-                # Kirim Close ke client jika belum
                 try:
                     await send_frame(writer, 0x8, b"")
                 except Exception:
@@ -267,7 +296,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
 async def main():
     server = await asyncio.start_server(handle_client, LISTEN_HOST, LISTEN_PORT, limit=32768)
     log.info("==========================================================================")
-    log.info("WS PROXY LENGKAP (FRAME PARSER) AKTIF di %s:%s -> SSH %s:%s",
+    log.info("WS PROXY LENGKAP (FRAME PARSER + FRAGMENTASI) AKTIF di %s:%s -> SSH %s:%s",
              LISTEN_HOST, LISTEN_PORT, TARGET_HOST, TARGET_PORT)
     log.info("==========================================================================")
     async with server:
