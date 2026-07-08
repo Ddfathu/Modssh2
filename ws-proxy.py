@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-WebSocket <-> SSH proxy (Signal Armor Premium Version).
+WebSocket <-> SSH proxy (Signal Armor Premium Fixed Version).
 
-Menerima koneksi HTTP dari Dark Tunnel/HTTP Custom. Kode ini dilengkapi 
-dengan kasta tertinggi optimalisasi jaringan (TCP_NODELAY + Buffer 512KB) 
-serta dituning dengan "Signal Armor" agar koneksi melekat kuat seperti perangko, 
-kebal dari rekonek prematur meskipun sinyal HP drop hingga ke titik terendah.
+Menerima koneksi HTTP dari Dark Tunnel/HTTP Custom. Kode ini menggunakan kasta 
+tertinggi optimalisasi jaringan (TCP_NODELAY + Buffer 512KB) serta dituning 
+dengan "Signal Armor" yang sudah diperbaiki secara presisi agar koneksi melekat 
+kuat seperti perangko tanpa memicu eror 502 Bad Gateway.
 
 [UPDATE 2026]: Dioptimalkan untuk lingkungan Docker/Serverless (Railway.app)
 dengan suntikan Socket TCP Keepalive level dewa langsung di aplikasi.
@@ -60,7 +60,6 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
     peer = writer.get_extra_info("peername")
 
     try:
-        # Baca header awal
         raw_headers = await reader.read(8192)
         if not raw_headers:
             writer.close()
@@ -97,7 +96,6 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         writer.write(response.encode())
         await writer.drain()
 
-        # Hubungkan ke Dropbear internal
         try:
             target_reader, target_writer = await asyncio.open_connection(
                 TARGET_HOST, TARGET_PORT
@@ -158,7 +156,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                     await dst.drain()
             except (ConnectionResetError, asyncio.IncompleteReadError):
                 pass
-            except Exception campaigners:
+            except Exception:
                 pass
             finally:
                 try:
@@ -191,25 +189,26 @@ async def main():
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 524288)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 524288)
             
-            # 🔥 TUNING SIGNAL ARMOR (Anti-Disconnect Level Dewa):
+            # 🔥 PERBAIKAN TUNING KERNEL (Anti-Disconnect Tanpa Bug 502):
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
             try:
-                # Jeda sebelum memulai probe dinaikkan jadi 30 detik (menghindari panik saat sinyal drop)
+                # Beri kelonggaran awal 30 detik saat sinyal hilang kontak
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30)
-                # Kirim paket pengecekan setiap 10 detik sekali jika HP hilang kontak
+                # Jeda antar pengiriman sinyal pancingan (10 detik)
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
-                # Toleransi kesalahan dinaikkan menjadi 12 kali gagal (Total pertahanan = 30 + (10 * 12) = 150 detik!)
-                # Server akan sabar menunggu sinyal HP lu balik selama 2,5 menit sebelum memutus koneksi murni.
-                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEBCNT if hasattr(socket, 'TCP_KEEBCNT') else 6, 12)
-            except AttributeError:
-                pass
+                # KOREKSI: Menggunakan konstanta TCP_KEEPCNT asli Linux secara presisi
+                # Jika sistem tidak mendeteksi atribut teksnya, otomatis fallback aman ke angka sistem (6)
+                keepcnt_opt = getattr(socket, 'TCP_KEEPCNT', 6)
+                sock.setsockopt(socket.IPPROTO_TCP, keepcnt_opt, 12)
+            except Exception as e:
+                log.debug("Gagal setting keepalive kernel: %s", e)
 
     async def client_connected_cb(reader, writer):
         configure_socket(writer)
         await handle_client(reader, writer)
 
     server = await asyncio.start_server(client_connected_cb, LISTEN_HOST, LISTEN_PORT, limit=32768)
-    log.info("WS proxy jalan di %s:%s -> Dropbear Active (Signal Armor Mode Enabled)", LISTEN_HOST, LISTEN_PORT)
+    log.info("WS proxy jalan di %s:%s -> Dropbear Active (Fixed Signal Armor Enabled)", LISTEN_HOST, LISTEN_PORT)
     async with server:
         await server.serve_forever()
 
