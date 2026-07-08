@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-WebSocket <-> SSH proxy (Enhanced Hybrid Server-Side Version).
+WebSocket <-> SSH proxy (Continuous Enhanced Total Version).
 
 Menerima koneksi HTTP/WebSocket di suatu port. Script ini dimodifikasi khusus
-agar kebal terhadap payload super panjang, menyaring sisa teks manipulasi,
-serta mengimplementasikan trik Server-Side Enhanced (Fragmentasi Respon + Delay)
-agar aplikasi yang tidak memiliki fitur enhanced (seperti Dark Tunnel) bisa tetap
-konek stabil tanpa terputus (anti-RST) setelah sukses autentikasi password.
+agar kebal terhadap payload super panjang, menyaring sisa teks kombinasi lokal,
+serta mengimplementasikan trik Server-Side Continuous Enhanced (Fragmentasi Agresif
+selama 15 paket awal) agar aplikasi polosan seperti Dark Tunnel tidak ditendang 
+oleh RST operator pasca sukses autentikasi password.
 
 [UPDATE 2026]: Dioptimalkan untuk lingkungan Docker/Serverless (Railway.app)
 dengan suntikan Socket TCP Keepalive langsung di level aplikasi.
@@ -132,7 +132,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                         # Cek apakah banner SSH sudah masuk ke dalam tumpukan payload kustom
                         if b"SSH-" in buffer_data:
                             idx = buffer_data.find(b"SSH-")
-                            # Potong teks sampah (PATCH/GET/POST), ambil dari banner "SSH-" ke belakang
+                            # Potong teks sampah lokal, ambil dari banner "SSH-" ke belakang
                             clean_data = buffer_data[idx:]
                             
                             dst.write(clean_data)
@@ -141,7 +141,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                             first_packet = False  # Handshake aman, matikan filter
                             buffer_data = b""     # Bersihkan penampung buffer
                         else:
-                            # Jika belum ada banner SSH, tamping terus datanya (menghindari packet splitting)
+                            # Jika belum ada banner SSH, tampung terus datanya (menghindari packet splitting)
                             if len(buffer_data) > 32768: 
                                 log.warning("Buffer penuh tanpa SSH banner. Membersihkan data sampah...")
                                 buffer_data = b""
@@ -160,31 +160,30 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 except Exception:
                     pass
 
-        # --- SERVER-SIDE ENHANCED: Mengecoh DPI Operator dari Sisi Server (Anti-Disconnect Dark Tunnel) ---
+        # --- SERVER-SIDE ENHANCED TOTAL: Mengamankan Jalur Pasca-Login ---
         async def pipe_ssh_to_client(src: asyncio.StreamReader, dst: asyncio.StreamWriter):
-            first_packet = True
+            packet_count = 0
             try:
                 while True:
                     data = await src.read(65536)
                     if not data:
                         break
                     
-                    # Jika ini respon/paket pertama dari SSH (Handshake/Banner)
-                    if first_packet and b"SSH-" in data:
-                        log.info("Mengaktifkan Server-Side Enhanced Trick untuk Dark Tunnel...")
+                    # Mengacak 15 paket pertama (proses handshake SSH + kirim data pasca-login)
+                    if packet_count < 15:
+                        packet_count += 1
+                        log.info("Mengacak paket balasan pasca-login ke-%d untuk Dark Tunnel...", packet_count)
                         
-                        # Pecah paket SSH menjadi potongan kecil (per 3 bytes)
-                        chunk_size = 3
+                        # Pecah paket menjadi potongan sangat kecil (per 2 bytes)
+                        chunk_size = 2
                         for i in range(0, len(data), chunk_size):
                             chunk = data[i:i+chunk_size]
                             dst.write(chunk)
                             await dst.drain()
-                            # Beri jeda super singkat (0.01 detik) agar DPI operator gagal membaca signature SSH
-                            await asyncio.sleep(0.01)
-                            
-                        first_packet = False # Trik selesai, paket berikutnya dikirim normal speed
+                            # Jeda super singkat (0.005 detik) agar sensor operator gagal mengendus pola SSH
+                            await asyncio.sleep(0.005)
                     else:
-                        # Jalur data setelah terkoneksi (normal speed)
+                        # Setelah fase kritis terlewati, kembalikan ke kecepatan penuh
                         dst.write(data)
                         await dst.drain()
                         
@@ -218,9 +217,7 @@ async def main():
     def configure_socket(writer_spec):
         sock = writer_spec.get_extra_info('socket')
         if sock is not None:
-            # Aktifkan instruksi Keepalive dasar
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-            # Tuning agresif: Cek tiap 15 detik, ulangi per 5 detik jika loss, drop setelah 3x gagal
             try:
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 15)
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 5)
@@ -228,7 +225,6 @@ async def main():
             except AttributeError:
                 pass
 
-    # Menggunakan callback dinamis untuk menangkap transport socket client sebelum diproses
     async def client_connected_cb(reader, writer):
         configure_socket(writer)
         await handle_client(reader, writer)
@@ -237,7 +233,7 @@ async def main():
     server = await asyncio.start_server(client_connected_cb, LISTEN_HOST, LISTEN_PORT, limit=8192)
     
     log.info(
-        "WS proxy jalan di %s:%s -> Dropbear Backend Active (Server-Side Enhanced Injector Mode)",
+        "WS proxy jalan di %s:%s -> Dropbear Backend Active (Continuous Enhanced Enabled)",
         LISTEN_HOST, LISTEN_PORT,
     )
     async with server:
