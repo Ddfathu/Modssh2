@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-WebSocket <-> SSH proxy (Mega-Complex Protector Edition).
+WebSocket <-> SSH Proxy (Full Frame Parser Edition).
 
-Kombinasi seluruh kasta tertinggi manipulasi jaringan:
-1. ENHANCED PAYLOAD MATCHING: Penyaring fragmentasi & pemotong teks sampah (BMOVE/PATCH).
-2. BLIND PREMIUM HANDSHAKE: Kebal respon 301 Moved Permanently dari operator.
-3. TURBO ENGINE: Mematikan Algoritma Nagle (TCP_NODELAY) demi ping super responsif.
-4. MONSTER BUFFER: Alokasi 512KB RAM Kernel untuk download/upload gajah.
-5. SIGNAL ARMOR: Mengunci socket hingga 2,5 menit saat HP kehilangan sinyal.
-6. APPLICATION HEARTBEAT: Menyemburkan frame biner \x89\x00 tiap 5 detik agar HTTP Custom anti-DC.
+Mendukung:
+- Handshake WebSocket (RFC 6455)
+- Parsing & unmasking frame
+- Binary/Text frame ke SSH, dan sebaliknya
+- Ping/Pong otomatis (dengan heartbeat periodik)
+- Close frame graceful
+- TCP_NODELAY, buffer 512KB, keepalive 2,5 menit
 """
 
 import asyncio
@@ -20,10 +20,11 @@ import signal
 import sys
 import secrets
 import socket
+import struct
+import time
 
 WS_MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
-# Konfigurasi Environment / Default Railway
 LISTEN_HOST = "0.0.0.0"
 LISTEN_PORT = int(os.environ.get("WS_PORT", "8880"))
 TARGET_HOST = os.environ.get("WS_TARGET_HOST", "127.0.0.1")
@@ -31,16 +32,94 @@ TARGET_PORT = int(os.environ.get("WS_TARGET_PORT", "22"))
 
 logging.basicConfig(
     level=logging.INFO,
-    format="[mega-proxy] %(asctime)s %(levelname)s %(message)s",
+    format="[ws-proxy] %(asctime)s %(levelname)s %(message)s",
 )
-log = logging.getLogger("mega-proxy")
+log = logging.getLogger("ws-proxy")
 
 
-def parse_headers(raw: bytes) -> dict:
-    """Mesin penganalisis header HTTP tingkat tinggi."""
-    headers = {}
+# =====================================================================
+#  FUNGSI HANDLER FRAME WEBSOCKET (RFC 6455)
+# =====================================================================
+
+async def read_frame(reader: asyncio.StreamReader):
+    """
+    Membaca satu frame WebSocket dari reader.
+    Return: (opcode, payload)  (payload sudah di-unmask jika perlu)
+    Raise:  ConnectionResetError jika koneksi putus.
+    """
+    header = await reader.readexactly(2)
+    byte1, byte2 = header[0], header[1]
+
+    fin = (byte1 & 0x80) != 0
+    opcode = byte1 & 0x0F
+    masked = (byte2 & 0x80) != 0
+    payload_len = byte2 & 0x7F
+
+    # Baca extended length jika perlu
+    if payload_len == 126:
+        ext = await reader.readexactly(2)
+        payload_len = struct.unpack('>H', ext)[0]
+    elif payload_len == 127:
+        ext = await reader.readexactly(8)
+        payload_len = struct.unpack('>Q', ext)[0]
+
+    # Baca masking key jika ada
+    mask_key = b''
+    if masked:
+        mask_key = await reader.readexactly(4)
+
+    # Baca payload
+    payload = await reader.readexactly(payload_len)
+
+    # Unmask jika perlu
+    if masked:
+        payload = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
+
+    # Untuk frame kontrol (Ping/Pong/Close), fin harus 1
+    if opcode in (0x8, 0x9, 0xA) and not fin:
+        raise ValueError("Control frame must have FIN=1")
+
+    return opcode, payload
+
+
+async def send_frame(writer: asyncio.StreamWriter, opcode: int, payload: bytes):
+    """
+    Mengirim satu frame WebSocket (tanpa masking, karena server -> client tidak wajib mask).
+    """
+    header = bytearray()
+    header.append(0x80 | opcode)  # FIN=1
+
+    length = len(payload)
+    if length <= 125:
+        header.append(length)
+    elif length <= 65535:
+        header.append(126)
+        header.extend(struct.pack('>H', length))
+    else:
+        header.append(127)
+        header.extend(struct.pack('>Q', length))
+
+    writer.write(bytes(header) + payload)
+    await writer.drain()
+
+
+# =====================================================================
+#  FUNGSI UTAMA PROXY
+# =====================================================================
+
+async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    peer = writer.get_extra_info("peername")
+    log.info("Koneksi masuk dari %s", peer)
+
     try:
-        header_part = raw.split(b"\r\n\r\n", 1)[0]
+        # 1. BACA HEADER HANDSHAKE
+        raw_headers = await reader.read(8192)
+        if not raw_headers:
+            writer.close()
+            return
+
+        headers = {}
+        header_part = raw_headers.split(b"\r\n\r\n", 1)[0]
         lines = header_part.decode(errors="ignore").split("\r\n")
         for line in lines[1:]:
             if not line:
@@ -48,195 +127,154 @@ def parse_headers(raw: bytes) -> dict:
             if ":" in line:
                 k, v = line.split(":", 1)
                 headers[k.strip().lower()] = v.strip()
-    except Exception as e:
-        log.debug("Gagal analisa header: %s", e)
-    return headers
 
-
-def make_accept_key(ws_key: str) -> str:
-    """Pembuat kunci enkripsi handshake WebSocket."""
-    sha1 = hashlib.sha1((ws_key + WS_MAGIC).encode()).digest()
-    return base64.b64encode(sha1).decode()
-
-
-async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-    peer = writer.get_extra_info("peername")
-    log.info("Koneksi masuk dari client: %s", peer)
-
-    try:
-        # Membaca header awal dengan kapasitas muat besar (Anti-Overload)
-        raw_headers = await reader.read(8192)
-        if not raw_headers:
-            writer.close()
-            return
-
-        headers = parse_headers(raw_headers)
-        raw_text_lower = raw_headers.decode(errors="ignore").lower()
-
-        # Ekstraksi Sec-WebSocket-Key secara berlapis (Sangat Kompleks)
         ws_key = headers.get("sec-websocket-key")
-        if not ws_key and "sec-websocket-key:" in raw_text_lower:
-            try:
-                for line in raw_headers.decode(errors="ignore").split("\r\n"):
-                    if "sec-websocket-key" in line.lower():
-                        ws_key = line.split(":", 1)[1].strip()
-                        break
-            except Exception:
-                pass
+        if not ws_key:
+            # Coba ekstrak manual
+            for line in lines:
+                if "sec-websocket-key" in line.lower():
+                    ws_key = line.split(":", 1)[1].strip()
+                    break
 
-        # Autopilot Key Generator jika client mengirim format rusak
         if not ws_key:
             ws_key = base64.b64encode(secrets.token_bytes(16)).decode()
 
-        # Menembakkan proteksi Jabat Tangan 101 (Mengunci HP & Kebal Sensor 301)
-        accept_key = make_accept_key(ws_key)
-        response = (
+        # 2. BALAS HANDSHAKE 101
+        accept_key = base64.b64encode(
+            hashlib.sha1((ws_key + WS_MAGIC).encode()).digest()
+        ).decode()
+        resp = (
             "HTTP/1.1 101 Switching Protocols\r\n"
             "Upgrade: websocket\r\n"
             "Connection: Upgrade\r\n"
             f"Sec-WebSocket-Accept: {accept_key}\r\n"
         )
         if "sec-websocket-protocol" in headers:
-            response += f"Sec-WebSocket-Protocol: {headers['sec-websocket-protocol']}\r\n"
-        response += "\r\n"
-        
-        writer.write(response.encode())
+            resp += f"Sec-WebSocket-Protocol: {headers['sec-websocket-protocol']}\r\n"
+        resp += "\r\n"
+        writer.write(resp.encode())
         await writer.drain()
 
-        # Menghubungkan gerbang ke Dropbear SSH internal
+        # 3. HUBUNGKAN KE SSH BACKEND
         try:
             target_reader, target_writer = await asyncio.open_connection(
                 TARGET_HOST, TARGET_PORT
             )
         except Exception as e:
-            log.error("Gagal interkoneksi ke Dropbear Backend -> %s", e)
+            log.error("Gagal konek ke SSH: %s", e)
+            await send_frame(writer, 0x8, b"SSH backend unavailable")
             writer.close()
             return
 
-        # Suntik TCP_NODELAY ke socket target SSH
-        target_sock = target_writer.get_extra_info('socket')
-        if target_sock is not None:
-            target_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        # Optimasi socket
+        for w in (writer, target_writer):
+            sock = w.get_extra_info('socket')
+            if sock:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 524288)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 524288)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                try:
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30)
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+                    keepcnt = getattr(socket, 'TCP_KEEPCNT', 6)
+                    sock.setsockopt(socket.IPPROTO_TCP, keepcnt, 12)
+                except Exception:
+                    pass
 
-        # =====================================================================
-        # JALUR UPLOAD (HP -> SERVER): FITUR PENYARING PAYLOAD ENHANCED (ASLI)
-        # =====================================================================
-        async def pipe_client_to_ssh(src: asyncio.StreamReader, dst: asyncio.StreamWriter):
-            first_packet = True
-            buffer_data = b""
+        # 4. TASK HEARTBEAT (kirim Ping setiap 5 detik)
+        async def heartbeat():
+            while True:
+                await asyncio.sleep(5)
+                try:
+                    await send_frame(writer, 0x9, b"")  # Ping
+                except Exception:
+                    break
+
+        # 5. TASK: BACA FRAME DARI CLIENT -> TERUSKAN KE SSH
+        async def client_to_ssh():
             try:
                 while True:
-                    data = await src.read(65536)
+                    opcode, payload = await read_frame(reader)
+                    if opcode == 0x8:  # Close
+                        log.info("Client mengirim Close frame")
+                        # Kirim balik Close
+                        await send_frame(writer, 0x8, payload)
+                        break
+                    elif opcode == 0x9:  # Ping -> balas Pong
+                        await send_frame(writer, 0xA, payload)
+                    elif opcode == 0xA:  # Pong (abaikan)
+                        pass
+                    elif opcode in (0x1, 0x2):  # Text atau Binary -> kirim ke SSH
+                        target_writer.write(payload)
+                        await target_writer.drain()
+                    else:
+                        log.warning("Opcode tidak dikenal: 0x%X", opcode)
+            except (ConnectionResetError, asyncio.IncompleteReadError):
+                log.debug("Client putus koneksi saat baca frame")
+            except Exception as e:
+                log.error("Error di client->ssh: %s", e)
+            finally:
+                # Tutup target SSH jika belum
+                try:
+                    target_writer.close()
+                except Exception:
+                    pass
+                # Kirim Close ke client jika belum
+                try:
+                    await send_frame(writer, 0x8, b"")
+                except Exception:
+                    pass
+
+        # 6. TASK: BACA DARI SSH -> KIRIM KE CLIENT (BINARY FRAME)
+        async def ssh_to_client():
+            try:
+                while True:
+                    data = await target_reader.read(65536)
                     if not data:
                         break
-                    
-                    if first_packet:
-                        buffer_data += data
-                        # Logika pengumpul buffer fragmentasi (Jantung Versi Pertama)
-                        if b"SSH-" in buffer_data:
-                            idx = buffer_data.find(b"SSH-")
-                            clean_data = buffer_data[idx:]
-                            
-                            dst.write(clean_data)
-                            await dst.drain()
-                            
-                            first_packet = False
-                            buffer_data = b""
-                        else:
-                            if len(buffer_data) > 65536: 
-                                log.warning("Payload sampah terlalu panjang, mereset buffer...")
-                                buffer_data = b""
-                            continue
-                    else:
-                        dst.write(data)
-                        await dst.drain()
+                    await send_frame(writer, 0x2, data)  # Binary frame
             except Exception as e:
-                log.debug("Kendala pada jalur upload: %s", e)
+                log.debug("Error di ssh->client: %s", e)
             finally:
                 try:
-                    dst.close()
+                    writer.close()
                 except Exception:
                     pass
 
-        # =====================================================================
-        # JALUR DOWNSTREAM (SERVER -> HP): INJEKSI ULTRA PERANGKO HEARTBEAT
-        # =====================================================================
-        async def pipe_ssh_to_client(src: asyncio.StreamReader, dst: asyncio.StreamWriter):
-            try:
-                while True:
-                    try:
-                        # Pengecekan keaktifan traffic selama 5 detik
-                        data = await asyncio.wait_for(src.read(65536), timeout=5.0)
-                        if not data:
-                            break
-                        dst.write(data)
-                        await dst.drain()
-                    except asyncio.TimeoutError:
-                        # Sinyal drop? Suntik instan bingkai biner WebSocket Ping ke HTTP Custom
-                        dst.write(b"\x89\x00")
-                        await dst.drain()
-            except Exception as e:
-                log.debug("Kendala pada jalur downstream: %s", e)
-            finally:
-                try:
-                    dst.close()
-                except Exception:
-                    pass
-
-        # Jalankan kedua pipa data secara paralel asinkron
+        # Jalankan semua task paralel
         await asyncio.gather(
-            pipe_client_to_ssh(reader, target_writer),
-            pipe_ssh_to_client(target_reader, writer),
+            client_to_ssh(),
+            ssh_to_client(),
+            heartbeat(),
+            return_exceptions=True
         )
 
     except Exception as e:
-        log.error("Error penanganan client %s: %s", peer, e)
+        log.error("Error umum: %s", e)
     finally:
         try:
             writer.close()
         except Exception:
             pass
-        log.info("Sesi koneksi %s selesai ditangani", peer)
+        log.info("Sesi %s selesai", peer)
 
+
+# =====================================================================
+#  MAIN SERVER
+# =====================================================================
 
 async def main():
-    def configure_socket(writer_spec):
-        sock = writer_spec.get_extra_info('socket')
-        if sock is not None:
-            # 1. TURBO OPTIMIZATION: Matikan Algoritma Nagle
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            
-            # 2. MONSTER BUFFER CAPACITY: Buka keran transmisi 512 KB
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 524288)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 524288)
-            
-            # 3. KERNEL SIGNAL ARMOR: Ketahanan Sinyal Drop (Toleransi 2,5 Menit)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-            try:
-                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30)
-                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
-                keepcnt_opt = getattr(socket, 'TCP_KEEPCNT', 6)
-                sock.setsockopt(socket.IPPROTO_TCP, keepcnt_opt, 12)
-            except Exception as e:
-                log.debug("Gagal menyuntikkan keepalive kernel Linux: %s", e)
-
-    async def client_connected_cb(reader, writer):
-        configure_socket(writer)
-        await handle_client(reader, writer)
-
-    # Membuka gerbang server dengan batasan limit 32KB
-    server = await asyncio.start_server(client_connected_cb, LISTEN_HOST, LISTEN_PORT, limit=32768)
+    server = await asyncio.start_server(handle_client, LISTEN_HOST, LISTEN_PORT, limit=32768)
     log.info("==========================================================================")
-    log.info("WS PROXY RUNNING -> BACKEND DROPBEAR (MEGA-COMPLEX PROTECTOR ACTIVE)")
+    log.info("WS PROXY LENGKAP (FRAME PARSER) AKTIF di %s:%s -> SSH %s:%s",
+             LISTEN_HOST, LISTEN_PORT, TARGET_HOST, TARGET_PORT)
     log.info("==========================================================================")
-    
     async with server:
         await server.serve_forever()
 
-
 def handle_sigterm(*_):
     sys.exit(0)
-
 
 if __name__ == "__main__":
     signal.signal(signal.SIGTERM, handle_sigterm)
