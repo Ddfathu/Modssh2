@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-WebSocket <-> SSH Proxy (Full Frame Parser + Fragmentasi).
+WebSocket <-> SSH Proxy (Enhanced Payload Filter + Full Frame Parser).
 
-Mendukung:
+Fitur:
 - Handshake WebSocket (RFC 6455)
-- Parsing & unmasking frame, termasuk fragmentasi (continuation)
-- Binary/Text frame ke SSH, dan sebaliknya
-- Ping/Pong otomatis (dengan heartbeat periodik)
+- Parsing frame dengan fragmentasi
+- Filter sampah awal: cari "SSH-" di akumulasi payload, buang semua sebelum
+- Setelah ketemu, langsung streaming
+- Ping/Pong otomatis + heartbeat periodik
 - Close frame graceful
-- Turbo, Buffer Monster, Signal Armor
+- TCP_NODELAY, buffer 512KB, keepalive 2,5 menit
 """
 
 import asyncio
@@ -43,8 +44,7 @@ log = logging.getLogger("ws-proxy")
 async def read_frame(reader: asyncio.StreamReader):
     """
     Membaca satu frame WebSocket dari reader.
-    Return: (fin, opcode, payload)  # fin = bool, payload sudah di-unmask
-    Raise:  ConnectionResetError jika koneksi putus.
+    Return: (fin, opcode, payload)  # payload sudah di-unmask
     """
     header = await reader.readexactly(2)
     byte1, byte2 = header[0], header[1]
@@ -54,7 +54,6 @@ async def read_frame(reader: asyncio.StreamReader):
     masked = (byte2 & 0x80) != 0
     payload_len = byte2 & 0x7F
 
-    # Baca extended length jika perlu
     if payload_len == 126:
         ext = await reader.readexactly(2)
         payload_len = struct.unpack('>H', ext)[0]
@@ -62,15 +61,12 @@ async def read_frame(reader: asyncio.StreamReader):
         ext = await reader.readexactly(8)
         payload_len = struct.unpack('>Q', ext)[0]
 
-    # Baca masking key jika ada
     mask_key = b''
     if masked:
         mask_key = await reader.readexactly(4)
 
-    # Baca payload
     payload = await reader.readexactly(payload_len)
 
-    # Unmask jika perlu
     if masked:
         payload = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
 
@@ -79,17 +75,15 @@ async def read_frame(reader: asyncio.StreamReader):
 
 async def read_message(reader: asyncio.StreamReader):
     """
-    Membaca satu pesan WebSocket (bisa terdiri dari beberapa frame).
-    Menggabungkan continuation frame hingga FIN=1.
-    Return: (opcode, payload)  # opcode dari frame pertama (0x1/0x2) atau control frame
+    Membaca satu pesan WebSocket (gabungan fragmentasi).
+    Return: (opcode, payload)  # opcode dari frame pertama (0x1/0x2) atau control
     """
     fin, opcode, payload = await read_frame(reader)
 
-    # Control frame (Ping/Pong/Close) tidak boleh difragmentasi
+    # Control frame tidak boleh difragmentasi
     if opcode in (0x8, 0x9, 0xA):
         return opcode, payload
 
-    # Jika sudah FIN, langsung kembali
     if fin:
         return opcode, payload
 
@@ -98,29 +92,25 @@ async def read_message(reader: asyncio.StreamReader):
     while not fin:
         fin, next_opcode, next_payload = await read_frame(reader)
         if next_opcode != 0x0:  # Harus continuation
-            # Jika bukan continuation, kita anggap sebagai frame baru (tidak sesuai RFC)
             log.warning("Ditemukan opcode %X saat menunggu continuation", next_opcode)
-            # Gabungkan yang sudah ada dan return, atau lempar error? Lebih baik return yang ada
             break
         fragments.append(next_payload)
-        # Jika sudah fin, loop berhenti
         if fin:
             break
 
-    # Gabungkan semua payload
     full_payload = b''.join(fragments)
     return opcode, full_payload
 
 
 async def send_frame(writer: asyncio.StreamWriter, opcode: int, payload: bytes, fin: bool = True):
     """
-    Mengirim satu frame WebSocket (tanpa masking, karena server -> client tidak wajib mask).
+    Kirim satu frame WebSocket (tanpa masking, server -> client).
     """
     header = bytearray()
     if fin:
         header.append(0x80 | opcode)
     else:
-        header.append(opcode)  # FIN=0
+        header.append(opcode)
 
     length = len(payload)
     if length <= 125:
@@ -219,30 +209,62 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             while True:
                 await asyncio.sleep(5)
                 try:
-                    await send_frame(writer, 0x9, b"")  # Ping
+                    await send_frame(writer, 0x9, b"")
                 except Exception:
                     break
 
-        # 5. TASK: BACA PESAN DARI CLIENT -> TERUSKAN KE SSH
+        # 5. TASK: CLIENT -> SSH (dengan filter sampah "SSH-")
         async def client_to_ssh():
+            buffer = b""          # akumulasi payload dari frame
+            found = False         # apakah sudah ketemu "SSH-"
+            max_buffer = 65536    # batas aman
+
             try:
                 while True:
                     opcode, payload = await read_message(reader)
+
+                    # Tangani frame kontrol
                     if opcode == 0x8:  # Close
                         log.info("Client mengirim Close frame")
                         await send_frame(writer, 0x8, payload)
                         break
-                    elif opcode == 0x9:  # Ping -> balas Pong
+                    elif opcode == 0x9:  # Ping -> Pong
                         await send_frame(writer, 0xA, payload)
+                        continue
                     elif opcode == 0xA:  # Pong (abaikan)
-                        pass
-                    elif opcode in (0x1, 0x2):  # Text atau Binary -> kirim ke SSH
+                        continue
+                    elif opcode not in (0x1, 0x2):  # Hanya text/binary
+                        log.warning("Opcode tidak dikenal: 0x%X", opcode)
+                        continue
+
+                    # Payload dari frame data (text/binary)
+                    if not found:
+                        # Akumulasi sampai ketemu "SSH-"
+                        buffer += payload
+                        idx = buffer.find(b"SSH-")
+                        if idx != -1:
+                            # Potong semua sebelum "SSH-"
+                            clean = buffer[idx:]
+                            target_writer.write(clean)
+                            await target_writer.drain()
+                            found = True
+                            buffer = b""  # kosongkan buffer
+                            log.info("SSH- ditemukan, mulai streaming")
+                        else:
+                            # Jika buffer terlalu besar dan belum ketemu, reset (anggap sampah)
+                            if len(buffer) > max_buffer:
+                                log.warning("Buffer sampah melebihi batas, direset")
+                                buffer = b""
+                                # Opsi: tetap lanjutkan tanpa found? Kita bisa anggap found=True agar tidak terus menumpuk
+                                # Tapi lebih aman kita set found=True dan kirim buffer terakhir?
+                                # Di sini kita reset dan tetap mencari di data berikutnya
+                    else:
+                        # Sudah found, langsung kirim
                         target_writer.write(payload)
                         await target_writer.drain()
-                    else:
-                        log.warning("Opcode tidak dikenal: 0x%X", opcode)
+
             except (ConnectionResetError, asyncio.IncompleteReadError):
-                log.debug("Client putus koneksi saat baca pesan")
+                log.debug("Client putus koneksi")
             except Exception as e:
                 log.error("Error di client->ssh: %s", e)
             finally:
@@ -255,14 +277,14 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 except Exception:
                     pass
 
-        # 6. TASK: BACA DARI SSH -> KIRIM KE CLIENT (BINARY FRAME)
+        # 6. TASK: SSH -> CLIENT (kirim sebagai binary frame)
         async def ssh_to_client():
             try:
                 while True:
                     data = await target_reader.read(65536)
                     if not data:
                         break
-                    await send_frame(writer, 0x2, data)  # Binary frame
+                    await send_frame(writer, 0x2, data)
             except Exception as e:
                 log.debug("Error di ssh->client: %s", e)
             finally:
@@ -271,7 +293,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 except Exception:
                     pass
 
-        # Jalankan semua task paralel
+        # Jalankan ketiga task paralel
         await asyncio.gather(
             client_to_ssh(),
             ssh_to_client(),
@@ -296,14 +318,16 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
 async def main():
     server = await asyncio.start_server(handle_client, LISTEN_HOST, LISTEN_PORT, limit=32768)
     log.info("==========================================================================")
-    log.info("WS PROXY LENGKAP (FRAME PARSER + FRAGMENTASI) AKTIF di %s:%s -> SSH %s:%s",
+    log.info("WS PROXY ENHANCED (FILTER + FRAME PARSER) AKTIF di %s:%s -> SSH %s:%s",
              LISTEN_HOST, LISTEN_PORT, TARGET_HOST, TARGET_PORT)
     log.info("==========================================================================")
     async with server:
         await server.serve_forever()
 
+
 def handle_sigterm(*_):
     sys.exit(0)
+
 
 if __name__ == "__main__":
     signal.signal(signal.SIGTERM, handle_sigterm)
