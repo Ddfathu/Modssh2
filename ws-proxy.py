@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-WebSocket <-> SSH proxy (High-Speed Pure Pipe Version).
+WebSocket <-> SSH proxy (Enhanced Hybrid Server-Side Version).
 
-Menerima koneksi HTTP/WebSocket. Script ini dipangkas murni untuk kestabilan tinggi.
-Memotong teks sampah manipulasi lokal di awal secara instan, lalu membuka jalur 
-piping tanpa delay sedikit pun agar terhindar dari kendala 'HTTP Ping Timeout'.
+Menerima koneksi HTTP/WebSocket di suatu port. Script ini dimodifikasi khusus
+agar kebal terhadap payload super panjang, menyaring sisa teks manipulasi,
+serta mengimplementasikan trik Server-Side Enhanced (Fragmentasi Respon + Delay)
+agar aplikasi yang tidak memiliki fitur enhanced (seperti Dark Tunnel) bisa tetap
+konek stabil tanpa terputus (anti-RST) setelah sukses autentikasi password.
 
 [UPDATE 2026]: Dioptimalkan untuk lingkungan Docker/Serverless (Railway.app)
 dengan suntikan Socket TCP Keepalive langsung di level aplikasi.
@@ -115,7 +117,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             writer.close()
             return
 
-        # --- TUNING DROPBEAR FILTER: Memotong Teks Sampah di Awal Secara Instan ---
+        # --- TUNING DROPBEAR FILTER: Kebal Fragmentasi & Enhanced Payload ---
         async def pipe_client_to_ssh(src: asyncio.StreamReader, dst: asyncio.StreamWriter):
             first_packet = True
             buffer_data = b""
@@ -127,18 +129,25 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                     
                     if first_packet:
                         buffer_data += data
+                        # Cek apakah banner SSH sudah masuk ke dalam tumpukan payload kustom
                         if b"SSH-" in buffer_data:
                             idx = buffer_data.find(b"SSH-")
+                            # Potong teks sampah (PATCH/GET/POST), ambil dari banner "SSH-" ke belakang
                             clean_data = buffer_data[idx:]
+                            
                             dst.write(clean_data)
                             await dst.drain()
-                            first_packet = False
-                            buffer_data = b""
+                            
+                            first_packet = False  # Handshake aman, matikan filter
+                            buffer_data = b""     # Bersihkan penampung buffer
                         else:
+                            # Jika belum ada banner SSH, tamping terus datanya (menghindari packet splitting)
                             if len(buffer_data) > 32768: 
+                                log.warning("Buffer penuh tanpa SSH banner. Membersihkan data sampah...")
                                 buffer_data = b""
                             continue
                     else:
+                        # Aliran data normal setelah jabat tangan berhasil
                         dst.write(data)
                         await dst.drain()
             except (ConnectionResetError, asyncio.IncompleteReadError):
@@ -151,15 +160,34 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 except Exception:
                     pass
 
-        # --- HIGH SPEED SSH TO CLIENT: Los Tanpa Delay Biar Anti-Timeout ---
+        # --- SERVER-SIDE ENHANCED: Mengecoh DPI Operator dari Sisi Server (Anti-Disconnect Dark Tunnel) ---
         async def pipe_ssh_to_client(src: asyncio.StreamReader, dst: asyncio.StreamWriter):
+            first_packet = True
             try:
                 while True:
                     data = await src.read(65536)
                     if not data:
                         break
-                    dst.write(data)
-                    await dst.drain() # Aliran data langsung tanpa putus/jeda
+                    
+                    # Jika ini respon/paket pertama dari SSH (Handshake/Banner)
+                    if first_packet and b"SSH-" in data:
+                        log.info("Mengaktifkan Server-Side Enhanced Trick untuk Dark Tunnel...")
+                        
+                        # Pecah paket SSH menjadi potongan kecil (per 3 bytes)
+                        chunk_size = 3
+                        for i in range(0, len(data), chunk_size):
+                            chunk = data[i:i+chunk_size]
+                            dst.write(chunk)
+                            await dst.drain()
+                            # Beri jeda super singkat (0.01 detik) agar DPI operator gagal membaca signature SSH
+                            await asyncio.sleep(0.01)
+                            
+                        first_packet = False # Trik selesai, paket berikutnya dikirim normal speed
+                    else:
+                        # Jalur data setelah terkoneksi (normal speed)
+                        dst.write(data)
+                        await dst.drain()
+                        
             except (ConnectionResetError, asyncio.IncompleteReadError):
                 pass
             except Exception as e:
@@ -186,10 +214,13 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
 
 
 async def main():
+    # Fungsi internal untuk menyuntikkan TCP Keepalive langsung ke Socket level Container
     def configure_socket(writer_spec):
         sock = writer_spec.get_extra_info('socket')
         if sock is not None:
+            # Aktifkan instruksi Keepalive dasar
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            # Tuning agresif: Cek tiap 15 detik, ulangi per 5 detik jika loss, drop setelah 3x gagal
             try:
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 15)
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 5)
@@ -197,12 +228,18 @@ async def main():
             except AttributeError:
                 pass
 
+    # Menggunakan callback dinamis untuk menangkap transport socket client sebelum diproses
     async def client_connected_cb(reader, writer):
         configure_socket(writer)
         await handle_client(reader, writer)
 
+    # Mengunci 'limit=8192' agar buffer kebal total dari payload super panjang
     server = await asyncio.start_server(client_connected_cb, LISTEN_HOST, LISTEN_PORT, limit=8192)
-    log.info("WS proxy jalan di %s:%s -> Dropbear Backend Active (High-Speed Pure Pipe Mode)", LISTEN_HOST, LISTEN_PORT)
+    
+    log.info(
+        "WS proxy jalan di %s:%s -> Dropbear Backend Active (Server-Side Enhanced Injector Mode)",
+        LISTEN_HOST, LISTEN_PORT,
+    )
     async with server:
         await server.serve_forever()
 
