@@ -15,7 +15,7 @@ echo "[*] Mengonfigurasi Server Message Dropbear (Banner Pra-Login)..."
 cat << 'EOF' > /etc/dropbear_banner
 =================================================
                   SELAMAT MENIKMATI
-             PREMIUM SSH SERVER DROPBEAR         
+             PREMIUM SSH SERVER DROPBEAR modssh2        
 =================================================
        Dilarang Torrent / DDOS / Hacking! 
                  Powered By: dedefathu
